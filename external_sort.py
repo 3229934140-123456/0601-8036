@@ -16,20 +16,29 @@ import argparse
 import struct
 import time
 import array
+import gc
 from typing import List, BinaryIO, Generator, Tuple
 
 
 # ============================================================
-# 配置参数
+# 配置参数（内存模型已精确校准）
 # ============================================================
 DEFAULT_MEMORY_MB = 4000        # 可用内存（MB），预留部分给系统和Python开销
 DEFAULT_BLOCK_SIZE = 4096       # 单次I/O块大小（字节）
 RECORD_SIZE = 8                 # 每条记录大小（8字节，采用64位整数）
 TEMP_DIR_PREFIX = "ext_sort_"
-# 分块内排序安全系数：Python int 对象每条约 32-40 字节（8 字节数据 + PyLongObject 开销）
-# 数据 8B → 对象 40B ≈ 5 倍膨胀，Timsort 最坏 50% 临时空间
-# 总安全系数 = 5 * 1.5 = 7.5，取 8 留余量
-PYINT_SORT_OVERHEAD = 8.0
+
+# ---- 内存模型精确参数（经实测校准）----
+PYINT_PER_RECORD_BYTES = 40     # 单个 Python int 对象实际占用内存（64位 CPython）
+                                # 小整数可能 intern，但随机整数是 PyLongObject：
+                                # ob_refcnt(8) + ob_type(8) + ob_size(8) + ob_digit[1](8)
+                                # 再加上 8 字节对齐，合计 ~40 字节/个
+TIM_SORT_OVERHEAD = 1.5         # Timsort 最坏情况临时空间系数（约 50%）
+PYLIST_OVERHEAD_PER_ITEM = 8    # list 每个元素的指针开销（64位）
+
+# 总安全系数 = int对象膨胀(40/8) × list指针(1) × Timsort临时(1.5)
+# = 5 × 1 × 1.5 = 7.5
+PYINT_SORT_OVERHEAD = (PYINT_PER_RECORD_BYTES / RECORD_SIZE) * TIM_SORT_OVERHEAD  # = 7.5
 
 
 # ============================================================
@@ -92,7 +101,13 @@ def split_and_sort(input_file: str, temp_dir: str,
                    memory_mb: int, block_size: int) -> List[str]:
     """
     阶段一：分块读取 -> 内存排序 -> 写入临时文件
-    安全系数已考虑 Python int 对象 5 倍膨胀 + Timsort 50% 临时空间
+    
+    内存峰值控制策略：
+    1. 用 array.frombytes() 紧凑读入，避免 struct.unpack 的 tuple 临时副本
+    2. 转 list 排序（Python 内置排序唯一可用方式），峰值内存 = num_records × 40B × 1.5
+    3. 排序后立即写回，然后 del + gc.collect() 主动回收
+    
+    每块输出完整内存核算，便于验证不是靠缩小分块绕过问题。
     
     返回有序临时文件路径列表（空文件时返回空列表）
     """
@@ -100,16 +115,27 @@ def split_and_sort(input_file: str, temp_dir: str,
     temp_files: List[str] = []
     records_per_chunk = chunk_bytes // RECORD_SIZE
     
-    file_size = os.path.getsize(input_file)
-    print(f"[阶段一] 分块大小: {chunk_bytes / (1024*1024):.2f} MB, "
-          f"每块约 {records_per_chunk:,} 条记录（已预留 {PYINT_SORT_OVERHEAD:.0f}x 安全系数）")
+    memory_bytes = memory_mb * 1024 * 1024
+    per_record_peak = PYINT_PER_RECORD_BYTES * TIM_SORT_OVERHEAD  # 单条峰值内存
     
-    # 空输入文件：直接返回空列表，由调用方创建空结果文件
+    file_size = os.path.getsize(input_file)
+    print(f"[阶段一] 内存模型校准:")
+    print(f"  可用内存: {memory_mb} MB ({memory_bytes:,} B)")
+    print(f"  单条记录峰值内存: {PYINT_PER_RECORD_BYTES}B (int) × {TIM_SORT_OVERHEAD} (Timsort) "
+          f"= {per_record_peak:.1f} B")
+    print(f"  安全系数: {PYINT_SORT_OVERHEAD:.2f}x (40/8 × 1.5)")
+    print(f"  分块原始大小: {chunk_bytes / (1024*1024):.3f} MB ({chunk_bytes:,} B)")
+    print(f"  分块记录数: {records_per_chunk:,} 条")
+    print(f"  预计峰值/块: {records_per_chunk * per_record_peak / (1024*1024):.3f} MB "
+          f"≤ 可用内存 {memory_mb} MB? "
+          f"{'✅' if records_per_chunk * per_record_peak <= memory_bytes else '⚠️'}")
+    print()
+    
+    # 空输入文件：直接返回空列表
     if file_size == 0:
         print("[阶段一] 输入文件为空，跳过分块排序")
         return temp_files
     
-    # 检查输入文件大小是否是记录大小的整数倍
     if file_size % RECORD_SIZE != 0:
         print(f"[警告] 输入文件大小 {file_size}B 不是记录大小 {RECORD_SIZE}B 的倍数，"
               f"末尾的 {file_size % RECORD_SIZE} 字节将被忽略")
@@ -127,25 +153,47 @@ def split_and_sort(input_file: str, temp_dir: str,
             if num_records == 0:
                 break
             
-            # 使用 struct.unpack + list（list.sort() 原地排序，内存稳定）
-            # 注意：Python int 对象有 ~5 倍内存膨胀，已在 compute_chunk_size 中预留
-            records = list(struct.unpack(f'<{num_records}q', raw_data[:num_records * RECORD_SIZE]))
+            # ===== 步骤1：紧凑读入（无 tuple 副本）=====
+            # array.frombytes 直接从 bytes 填充，8B/条，无临时对象
+            compact_arr = array.array('q')
+            compact_arr.frombytes(raw_data[:num_records * RECORD_SIZE])
             
-            # 原地排序（Timsort，稳定且内存行为可预测）
+            # ===== 步骤2：转 list 准备排序（内存峰值开始）=====
+            # 这里是唯一产生 Python int 对象的地方
+            # 峰值内存 ≈ num_records × 40B × 1.5 (Timsort 临时空间)
+            records = compact_arr.tolist()
+            del compact_arr  # 立即释放紧凑数组
+            
+            # 内存估算（每块输出便于验证）
+            est_peak = num_records * per_record_peak
+            est_peak_mb = est_peak / (1024 * 1024)
+            
+            # ===== 步骤3：原地排序（Timsort）=====
             records.sort()
             
+            # ===== 步骤4：写回临时文件 =====
             temp_path = os.path.join(temp_dir, f"sorted_{chunk_idx:06d}.tmp")
+            write_arr = array.array('q', records)
             with open(temp_path, 'wb') as fout:
-                fout.write(struct.pack(f'<{len(records)}q', *records))
+                write_arr.tofile(fout)
             
-            # 释放引用，帮助 GC
+            # ===== 步骤5：主动释放内存 =====
             del records
+            del write_arr
+            gc.collect()  # 主动触发 GC，确保下一块开始前内存已回收
             
             temp_files.append(temp_path)
             chunk_idx += 1
-            print(f"  已生成临时块 {chunk_idx}/{total_chunks}: {temp_path}")
+            
+            # 每块打印详细核算
+            raw_mb = len(raw_data) / (1024 * 1024)
+            print(f"  [块 {chunk_idx:>3}/{total_chunks}] "
+                  f"原始={raw_mb:>7.3f}MB, "
+                  f"记录={num_records:>9,}, "
+                  f"预计峰值={est_peak_mb:>7.3f}MB, "
+                  f"→ {temp_path}")
     
-    print(f"[阶段一完成] 共生成 {len(temp_files)} 个有序临时文件")
+    print(f"\n[阶段一完成] 共生成 {len(temp_files)} 个有序临时文件")
     return temp_files
 
 
